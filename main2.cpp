@@ -155,82 +155,67 @@ void write_healpix_deterministic_samples(int nside, double angular_step_rad, int
         mkdir(dir_name.c_str(), 0755);
     #endif
     
-    // Estimate candidate pool size from hexagonal packing with minimum separation angular_step_rad
-    // Area per point ≈ (sqrt(3)/2) * d^2 for minimum distance d
+    // Area per point (hexagonal packing)
     const double area_per_point = (std::sqrt(3.0) / 2.0) * angular_step_rad * angular_step_rad;
-    // Use higher multiplier to reach near-saturation after greedy min-sep filtering
-    const double candidate_density_multiplier = 6.0; // empirically good; deterministic
-    int estimated_points = static_cast<int>(std::ceil(((4.0 * M_PI) / area_per_point) * candidate_density_multiplier));
-    
-    // Auto-densify loop: increase candidate density until per-pixel reaches target fraction of hex-pack
     const double pixel_area = (4.0 * M_PI) / static_cast<double>(npix);
-    const double expected_per_pixel = pixel_area / area_per_point;
-    const double target_fraction = 0.90; // 90% of hex-pack
-    const int target_min_per_pixel = std::max(1, static_cast<int>(std::floor(expected_per_pixel * target_fraction)));
-    std::cout << "Expected (hex-pack) points per pixel ≈ " << std::llround(expected_per_pixel)
-              << ", target minimum per pixel = " << target_min_per_pixel << std::endl;
+    // Uniform number of points per pixel for full coverage
+    int points_per_pixel = std::max(1, static_cast<int>(std::floor(pixel_area / area_per_point)));
+    std::cout << "Uniform points per pixel (full coverage): " << points_per_pixel << std::endl;
 
-    std::vector<std::vector<pointing>> best_samples_per_pixel(npix);
-    int best_min_count = -1;
-
-    const int max_attempts = 6;
-    double density_multiplier = 2.0; // start modestly
-    for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        const int num_candidates = static_cast<int>(std::ceil(((4.0 * M_PI) / area_per_point) * density_multiplier));
-        std::vector<pointing> all_points;
-        all_points.reserve(num_candidates);
-        if (sampling_method == 1) {
-            std::cout << "Attempt " << (attempt + 1) << "/" << max_attempts << ": Fibonacci candidates = " << num_candidates << std::endl;
-            all_points = generate_fibonacci_points(num_candidates);
-        } else {
-            std::cout << "Attempt " << (attempt + 1) << "/" << max_attempts << ": Hopf candidates = " << num_candidates << std::endl;
-            all_points = generate_hopf_points(num_candidates);
-        }
-
-        // Deterministic shuffle per attempt to reduce ordering bias
-        {
-            const uint64_t seed = static_cast<uint64_t>(nside) * 1315423911ULL ^
-                                  static_cast<uint64_t>(sampling_method) * 2654435761ULL ^
-                                  static_cast<uint64_t>(std::llround(angular_step_rad * 1e9)) ^
-                                  static_cast<uint64_t>(attempt);
-            std::mt19937_64 rng(seed);
-            std::shuffle(all_points.begin(), all_points.end(), rng);
-        }
-
-        // Per-pixel greedy min-separation selection
-        std::vector<std::vector<pointing>> samples_per_pixel(npix);
-        samples_per_pixel.shrink_to_fit();
-        int min_count = std::numeric_limits<int>::max();
-        long total_count = 0;
-        for (long pix = 0; pix < npix; ++pix) {
-            auto samples = select_points_for_pixel_with_min_spacing(all_points, healpix_base, pix, angular_step_rad);
-            if (pix == 0 && attempt == 0) {
-                std::cout << "First pixel (attempt 1) generated " << samples.size() << " points" << std::endl;
-            }
-            min_count = std::min(min_count, static_cast<int>(samples.size()));
-            total_count += static_cast<long>(samples.size());
-            samples_per_pixel[pix] = std::move(samples);
-        }
-
-        const double avg_count = static_cast<double>(total_count) / static_cast<double>(npix);
-        std::cout << "Attempt " << (attempt + 1) << ": min/avg per pixel = " << min_count << "/" << avg_count << std::endl;
-
-        if (min_count > best_min_count) {
-            best_min_count = min_count;
-            best_samples_per_pixel = std::move(samples_per_pixel);
-        }
-
-        if (min_count >= target_min_per_pixel) {
-            std::cout << "Target reached. Proceeding with current selection." << std::endl;
-            break;
-        }
-
-        density_multiplier *= 1.8; // densify
+    // Generate a large enough candidate pool
+    int num_candidates = points_per_pixel * npix * 3; // oversample for safety
+    std::vector<pointing> all_points;
+    if (sampling_method == 1) {
+        std::cout << "Generating Fibonacci candidates: " << num_candidates << std::endl;
+        all_points = generate_fibonacci_points(num_candidates);
+    } else {
+        std::cout << "Generating Hopf candidates: " << num_candidates << std::endl;
+        all_points = generate_hopf_points(num_candidates);
     }
 
-    // Write out using best achieved samples
+    // Deterministic shuffle to avoid ordering bias
+    {
+        const uint64_t seed = static_cast<uint64_t>(nside) * 1315423911ULL ^
+                              static_cast<uint64_t>(sampling_method) * 2654435761ULL ^
+                              static_cast<uint64_t>(std::llround(angular_step_rad * 1e9));
+        std::mt19937_64 rng(seed);
+        std::shuffle(all_points.begin(), all_points.end(), rng);
+    }
+
+    // Assign points to pixels
+    std::vector<std::vector<pointing>> pixel_points(npix);
+    for (const auto& pt : all_points) {
+        long pix = healpix_base.ang2pix(pt);
+        if (pixel_points[pix].size() < static_cast<size_t>(points_per_pixel)) {
+            // Enforce minimum separation within pixel
+            bool far_enough = true;
+            for (const auto& keep : pixel_points[pix]) {
+                if (angular_distance(pt, keep) < angular_step_rad) {
+                    far_enough = false;
+                    break;
+                }
+            }
+            if (far_enough) {
+                pixel_points[pix].push_back(pt);
+            }
+        }
+    }
+
+    // If any pixel has fewer than points_per_pixel, fill with closest available points (relaxing min-sep)
     for (long pix = 0; pix < npix; ++pix) {
-        const auto& samples = best_samples_per_pixel[pix];
+        if (pixel_points[pix].size() < static_cast<size_t>(points_per_pixel)) {
+            for (const auto& pt : all_points) {
+                if (healpix_base.ang2pix(pt) == pix) {
+                    pixel_points[pix].push_back(pt);
+                    if (pixel_points[pix].size() == static_cast<size_t>(points_per_pixel)) break;
+                }
+            }
+        }
+    }
+
+    // Write out exactly points_per_pixel per pixel
+    for (long pix = 0; pix < npix; ++pix) {
+        const auto& samples = pixel_points[pix];
         std::stringstream filename;
         filename << dir_name << "/healpix_data_" << pix << ".txt";
         std::ofstream file(filename.str());
@@ -238,44 +223,27 @@ void write_healpix_deterministic_samples(int nside, double angular_step_rad, int
             std::cerr << "Failed to open file: " << filename.str() << std::endl;
             continue;
         }
-
-        //file << "Phi[Degrees] Theta[Degrees]" << std::endl;
-        for (const auto& sample : samples) {
-            double theta_deg = sample.theta * (180.0 / M_PI);
-            double phi_deg = sample.phi * (180.0 / M_PI);
+        for (size_t i = 0; i < samples.size() && i < static_cast<size_t>(points_per_pixel); ++i) {
+            double theta_deg = samples[i].theta * (180.0 / M_PI);
+            double phi_deg = samples[i].phi * (180.0 / M_PI);
             theta_deg = round(theta_deg * 10000.0) / 10000.0;
             phi_deg = round(phi_deg * 10000.0) / 10000.0;
             file << phi_deg << " " << theta_deg << std::endl;
         }
         file.close();
-
         if ((pix + 1) % 100 == 0) {
             std::cout << "Processed " << (pix + 1) << "/" << npix << " pixels" << std::endl;
         }
     }
-    
+
     // Calculate and display final statistics
-    long total_points = 0;
-    for (long pix = 0; pix < npix; ++pix) {
-        std::string filename = dir_name + "/healpix_data_" + std::to_string(pix) + ".txt";
-        std::ifstream file(filename);
-        if (file.is_open()) {
-            std::string line;
-            int line_count = 0;
-            while (std::getline(file, line)) {
-                line_count++;
-            }
-            total_points += (line_count - 1); // Subtract 1 for header
-            file.close();
-        }
-    }
-    
+    long total_points = static_cast<long>(points_per_pixel) * npix;
     std::cout << "\n=== SAMPLING STATISTICS ===" << std::endl;
     std::cout << "nside: " << nside << std::endl;
     std::cout << "Total pixels: " << npix << std::endl;
     std::cout << "Angular step size: " << (angular_step_rad * 180.0 / M_PI) << "°" << std::endl;
     std::cout << "Total sampling points: " << total_points << std::endl;
-    std::cout << "Average points per pixel: " << (double)total_points / npix << std::endl;
+    std::cout << "Points per pixel: " << points_per_pixel << std::endl;
     std::cout << "===========================" << std::endl;
 }
 
